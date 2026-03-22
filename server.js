@@ -1,41 +1,94 @@
 const express = require('express');
-const multer = require('multer');
 const ffmpeg = require('fluent-ffmpeg');
 const fs = require('fs');
+const axios = require('axios');
 
 const app = express();
-const upload = multer({ dest: 'uploads/' });
+app.use(express.json());
 
 const API_KEY = process.env.FFMPEG_API_KEY;
 
-app.post('/process', upload.single('video'), (req, res) => {
-  if (req.headers['x-api-key'] !== API_KEY) {
-    return res.status(403).json({ error: 'Unauthorized' });
-  }
+app.post('/process', async (req, res) => {
+  try {
+    if (req.headers['x-api-key'] !== API_KEY) {
+      return res.status(403).json({ error: 'Unauthorized' });
+    }
 
-  if (!req.file) {
-    return res.status(400).json({ error: 'No video uploaded' });
-  }
+    const { videoUrl, watermarkUrl } = req.body;
 
-  const inputPath = req.file.path;
-  const outputPath = `output-${Date.now()}.mp4`;
+    if (!videoUrl) {
+      return res.status(400).json({ error: 'Missing videoUrl' });
+    }
 
-  ffmpeg(inputPath)
-    .outputOptions([
-      '-vf scale=320:-1',
-      '-t 5'
-    ])
-    .save(outputPath)
-    .on('end', () => {
-      res.download(outputPath, () => {
-        fs.unlinkSync(inputPath);
-        fs.unlinkSync(outputPath);
-      });
-    })
-    .on('error', (err) => {
-      console.error(err);
-      res.status(500).send('Error processing video');
+    const inputPath = `input-${Date.now()}.mp4`;
+    const watermarkPath = `watermark-${Date.now()}.png`;
+    const outputPath = `output-${Date.now()}.mp4`;
+
+    // Télécharger la vidéo
+    const videoResponse = await axios({
+      method: 'GET',
+      url: videoUrl,
+      responseType: 'stream',
     });
+
+    const videoWriter = fs.createWriteStream(inputPath);
+    videoResponse.data.pipe(videoWriter);
+
+    await new Promise((resolve) => videoWriter.on('finish', resolve));
+
+    // Télécharger watermark si fourni
+    if (watermarkUrl) {
+      const watermarkResponse = await axios({
+        method: 'GET',
+        url: watermarkUrl,
+        responseType: 'stream',
+      });
+
+      const watermarkWriter = fs.createWriteStream(watermarkPath);
+      watermarkResponse.data.pipe(watermarkWriter);
+
+      await new Promise((resolve) => watermarkWriter.on('finish', resolve));
+    }
+
+    // FFmpeg
+    let command = ffmpeg(inputPath).outputOptions([
+      '-c:v libx264',
+      '-preset fast',
+      '-crf 23',
+      '-c:a aac',
+      '-movflags +faststart'
+    ]);
+
+    if (watermarkUrl) {
+      command = command.complexFilter([
+        {
+          filter: 'overlay',
+          options: {
+            x: '(main_w-overlay_w)/2',
+            y: '(main_h-overlay_h)/2'
+          }
+        }
+      ]).input(watermarkPath);
+    }
+
+    command
+      .save(outputPath)
+      .on('end', () => {
+        res.download(outputPath, () => {
+          fs.unlinkSync(inputPath);
+          if (fs.existsSync(watermarkPath)) fs.unlinkSync(watermarkPath);
+          fs.unlinkSync(outputPath);
+        });
+      })
+      .on('error', (err) => {
+        console.error(err);
+        res.status(500).send('FFmpeg error');
+      });
+
+  } catch (err) {
+    console.error(err);
+    res.status(500).json({ error: 'Processing failed' });
+  }
 });
 
 app.get('/', (req, res) => {
