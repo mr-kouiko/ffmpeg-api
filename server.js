@@ -2,14 +2,21 @@ const express = require('express');
 const ffmpeg = require('fluent-ffmpeg');
 const fs = require('fs');
 const axios = require('axios');
+const cors = require('cors');
 
 const app = express();
+
+// ✅ FIX CORS
+app.use(cors());
+
+// ✅ JSON parsing
 app.use(express.json());
 
 const API_KEY = process.env.FFMPEG_API_KEY;
 
 app.post('/process', async (req, res) => {
   try {
+    // ✅ Vérif API key
     if (req.headers['x-api-key'] !== API_KEY) {
       return res.status(403).json({ error: 'Unauthorized' });
     }
@@ -24,7 +31,7 @@ app.post('/process', async (req, res) => {
     const watermarkPath = `watermark-${Date.now()}.png`;
     const outputPath = `output-${Date.now()}.mp4`;
 
-    // Télécharger la vidéo
+    // ✅ Télécharger la vidéo
     const videoResponse = await axios({
       method: 'GET',
       url: videoUrl,
@@ -36,7 +43,7 @@ app.post('/process', async (req, res) => {
 
     await new Promise((resolve) => videoWriter.on('finish', resolve));
 
-    // Télécharger watermark si fourni
+    // ✅ Télécharger watermark si fourni
     if (watermarkUrl) {
       const watermarkResponse = await axios({
         method: 'GET',
@@ -50,7 +57,7 @@ app.post('/process', async (req, res) => {
       await new Promise((resolve) => watermarkWriter.on('finish', resolve));
     }
 
-    // FFmpeg
+    // ✅ Commande FFmpeg
     let command = ffmpeg(inputPath).outputOptions([
       '-c:v libx264',
       '-preset fast',
@@ -60,15 +67,17 @@ app.post('/process', async (req, res) => {
     ]);
 
     if (watermarkUrl) {
-      command = command.complexFilter([
-        {
-          filter: 'overlay',
-          options: {
-            x: '(main_w-overlay_w)/2',
-            y: '(main_h-overlay_h)/2'
+      command = command
+        .input(watermarkPath)
+        .complexFilter([
+          {
+            filter: 'overlay',
+            options: {
+              x: '(main_w-overlay_w)/2',
+              y: '(main_h-overlay_h)/2'
+            }
           }
-        }
-      ]).input(watermarkPath);
+        ]);
     }
 
     command
