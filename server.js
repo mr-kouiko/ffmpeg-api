@@ -3,7 +3,6 @@ const cors = require('cors');
 const ffmpeg = require('fluent-ffmpeg');
 const fs = require('fs');
 const axios = require('axios');
-const path = require('path');
 
 const app = express();
 app.use(cors());
@@ -16,6 +15,9 @@ app.get('/', (req, res) => {
 });
 
 app.post('/compress', async (req, res) => {
+  let inputPath = null;
+  let outputPath = null;
+
   try {
     const videoUrl = req.body.url;
 
@@ -23,15 +25,17 @@ app.post('/compress', async (req, res) => {
       return res.status(400).json({ error: 'No URL provided' });
     }
 
-    const inputPath = `input-${Date.now()}.mp4`;
-    const outputPath = `output-${Date.now()}.mp4`;
+    inputPath = `input-${Date.now()}.mp4`;
+    outputPath = `output-${Date.now()}.mp4`;
 
-    // 📥 DOWNLOAD VIDEO
+    // 📥 DOWNLOAD VIDEO (avec timeout)
     const writer = fs.createWriteStream(inputPath);
+
     const response = await axios({
       url: videoUrl,
       method: 'GET',
-      responseType: 'stream'
+      responseType: 'stream',
+      timeout: 20000
     });
 
     response.data.pipe(writer);
@@ -43,14 +47,15 @@ app.post('/compress', async (req, res) => {
 
     console.log('Video downloaded:', fs.existsSync(inputPath));
 
-    // 🎬 FFMPEG (VERSION OPTIMISÉE POUR RAILWAY)
+    // 🎬 FFMPEG SAFE (ANTI CRASH RAILWAY)
     ffmpeg(inputPath)
       .outputOptions([
         '-c:v libx264',
-        '-preset ultrafast',     // ⚡ moins de CPU
-        '-crf 28',               // ⚡ compression + forte
-        '-vf scale=1280:-2',     // ⚡ 720p
-        '-threads 1',            // ⚡ évite SIGKILL
+        '-preset ultrafast',
+        '-crf 28',
+        '-vf scale=1280:-2',
+        '-threads 1',
+        '-max_muxing_queue_size 1024',
         '-c:a aac',
         '-b:a 96k',
         '-movflags +faststart'
@@ -58,15 +63,15 @@ app.post('/compress', async (req, res) => {
       .on('start', (cmd) => {
         console.log('FFmpeg command:', cmd);
       })
-      .on('stderr', (stderrLine) => {
-        console.log('FFmpeg stderr:', stderrLine);
+      .on('stderr', (line) => {
+        console.log('FFmpeg:', line);
       })
       .on('end', () => {
         console.log('Compression finished');
 
         res.download(outputPath, () => {
-          fs.unlinkSync(inputPath);
-          fs.unlinkSync(outputPath);
+          if (fs.existsSync(inputPath)) fs.unlinkSync(inputPath);
+          if (fs.existsSync(outputPath)) fs.unlinkSync(outputPath);
         });
       })
       .on('error', (err) => {
@@ -75,13 +80,21 @@ app.post('/compress', async (req, res) => {
         if (fs.existsSync(inputPath)) fs.unlinkSync(inputPath);
         if (fs.existsSync(outputPath)) fs.unlinkSync(outputPath);
 
-        res.status(500).json({ error: 'FFmpeg failed' });
+        if (!res.headersSent) {
+          res.status(500).json({ error: 'FFmpeg failed' });
+        }
       })
       .save(outputPath);
 
   } catch (err) {
-    console.error(err);
-    res.status(500).json({ error: 'Server error' });
+    console.error('SERVER ERROR:', err);
+
+    if (inputPath && fs.existsSync(inputPath)) fs.unlinkSync(inputPath);
+    if (outputPath && fs.existsSync(outputPath)) fs.unlinkSync(outputPath);
+
+    if (!res.headersSent) {
+      res.status(500).json({ error: 'Server error' });
+    }
   }
 });
 
