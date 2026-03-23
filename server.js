@@ -6,7 +6,7 @@ const cors = require('cors');
 
 const app = express();
 
-// ✅ FIX CORS
+// ✅ CORS
 app.use(cors());
 
 // ✅ JSON parsing
@@ -31,40 +31,62 @@ app.post('/process', async (req, res) => {
     const watermarkPath = `watermark-${Date.now()}.png`;
     const outputPath = `output-${Date.now()}.mp4`;
 
-    // ✅ Télécharger la vidéo
+    // ✅ DOWNLOAD VIDEO (FIX COMPLET)
     const videoResponse = await axios({
       method: 'GET',
       url: videoUrl,
       responseType: 'stream',
+      headers: {
+        'User-Agent': 'Mozilla/5.0'
+      }
     });
 
     const videoWriter = fs.createWriteStream(inputPath);
-    videoResponse.data.pipe(videoWriter);
 
-    await new Promise((resolve) => videoWriter.on('finish', resolve));
+    await new Promise((resolve, reject) => {
+      videoResponse.data.pipe(videoWriter);
+      videoWriter.on('finish', resolve);
+      videoWriter.on('error', reject);
+    });
 
-    // ✅ Télécharger watermark si fourni
+    // 🔥 IMPORTANT (Railway fix)
+    await new Promise(resolve => setTimeout(resolve, 1000));
+
+    console.log("Video downloaded:", fs.existsSync(inputPath));
+
+    // ✅ DOWNLOAD WATERMARK (optionnel)
     if (watermarkUrl) {
       const watermarkResponse = await axios({
         method: 'GET',
         url: watermarkUrl,
         responseType: 'stream',
+        headers: {
+          'User-Agent': 'Mozilla/5.0'
+        }
       });
 
       const watermarkWriter = fs.createWriteStream(watermarkPath);
-      watermarkResponse.data.pipe(watermarkWriter);
 
-      await new Promise((resolve) => watermarkWriter.on('finish', resolve));
+      await new Promise((resolve, reject) => {
+        watermarkResponse.data.pipe(watermarkWriter);
+        watermarkWriter.on('finish', resolve);
+        watermarkWriter.on('error', reject);
+      });
+
+      await new Promise(resolve => setTimeout(resolve, 500));
+
+      console.log("Watermark downloaded:", fs.existsSync(watermarkPath));
     }
 
-    // ✅ Commande FFmpeg
-    let command = ffmpeg(inputPath).outputOptions([
-      '-c:v libx264',
-      '-preset fast',
-      '-crf 23',
-      '-c:a aac',
-      '-movflags +faststart'
-    ]);
+    // ✅ FFMPEG
+    let command = ffmpeg(inputPath)
+      .outputOptions([
+        '-c:v libx264',
+        '-preset fast',
+        '-crf 23',
+        '-c:a aac',
+        '-movflags +faststart'
+      ]);
 
     if (watermarkUrl) {
       command = command
@@ -81,21 +103,33 @@ app.post('/process', async (req, res) => {
     }
 
     command
-      .save(outputPath)
-      .on('end', () => {
-        res.download(outputPath, () => {
-          fs.unlinkSync(inputPath);
-          if (fs.existsSync(watermarkPath)) fs.unlinkSync(watermarkPath);
-          fs.unlinkSync(outputPath);
-        });
+      .on('start', (cmd) => {
+        console.log("FFmpeg command:", cmd);
+      })
+      .on('stderr', (stderrLine) => {
+        console.log("FFmpeg stderr:", stderrLine);
       })
       .on('error', (err) => {
-        console.error(err);
+        console.error("FFmpeg ERROR:", err);
         res.status(500).send('FFmpeg error');
-      });
+      })
+      .on('end', () => {
+        console.log("FFmpeg DONE");
+
+        res.download(outputPath, () => {
+          try {
+            fs.unlinkSync(inputPath);
+            if (fs.existsSync(watermarkPath)) fs.unlinkSync(watermarkPath);
+            fs.unlinkSync(outputPath);
+          } catch (e) {
+            console.log("Cleanup error:", e);
+          }
+        });
+      })
+      .save(outputPath);
 
   } catch (err) {
-    console.error(err);
+    console.error("GLOBAL ERROR:", err);
     res.status(500).json({ error: 'Processing failed' });
   }
 });
