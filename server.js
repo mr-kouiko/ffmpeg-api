@@ -9,7 +9,8 @@ const app = express();
 app.use(cors());
 app.use(express.json());
 
-const PORT = process.env.PORT || 3000;
+// Render injecte automatiquement PORT=10000
+const PORT = process.env.PORT || 10000;
 
 // ===================== HEALTH CHECK =====================
 app.get('/', (req, res) => {
@@ -20,7 +21,7 @@ app.get('/', (req, res) => {
   });
 });
 
-// ===================== UTIL: DOWNLOAD FILE =====================
+// ===================== DOWNLOAD FILE =====================
 const downloadFile = async (url, outputPath) => {
   const writer = fs.createWriteStream(outputPath);
 
@@ -39,6 +40,16 @@ const downloadFile = async (url, outputPath) => {
   });
 };
 
+// ===================== CLEANUP =====================
+function cleanup(inputPath, outputPath) {
+  try {
+    if (inputPath && fs.existsSync(inputPath)) fs.unlinkSync(inputPath);
+    if (outputPath && fs.existsSync(outputPath)) fs.unlinkSync(outputPath);
+  } catch (e) {
+    console.error("Cleanup error:", e.message);
+  }
+}
+
 // ===================== COMPRESS VIDEO =====================
 app.post('/compress', async (req, res) => {
   let inputPath, outputPath;
@@ -53,11 +64,15 @@ app.post('/compress', async (req, res) => {
     inputPath = path.join('/tmp', `input-${id}.mp4`);
     outputPath = path.join('/tmp', `output-${id}.mp4`);
 
-    // 📥 Download
+    console.log("Downloading video...");
     await downloadFile(videoUrl, inputPath);
-    console.log('Video downloaded:', inputPath);
 
-    // 🎬 FFmpeg process
+    if (!fs.existsSync(inputPath)) {
+      throw new Error("Video download failed");
+    }
+
+    console.log("Running FFmpeg compression...");
+
     ffmpeg(inputPath)
       .outputOptions([
         '-c:v libx264',
@@ -69,24 +84,21 @@ app.post('/compress', async (req, res) => {
         '-b:a 96k',
         '-movflags +faststart'
       ])
-      .on('start', (cmd) => {
-        console.log('FFmpeg command:', cmd);
-      })
-      .on('error', (err) => {
-        console.error('FFmpeg ERROR:', err);
+      .on('start', cmd => console.log("FFmpeg:", cmd))
+      .on('error', err => {
+        console.error("FFMPEG ERROR:", err);
 
         cleanup(inputPath, outputPath);
 
         if (!res.headersSent) {
           res.status(500).json({
             success: false,
-            error: 'FFmpeg failed',
-            details: err.message
+            error: err.message
           });
         }
       })
       .on('end', () => {
-        console.log('Compression finished');
+        console.log("Compression done");
 
         res.download(outputPath, () => {
           cleanup(inputPath, outputPath);
@@ -95,21 +107,18 @@ app.post('/compress', async (req, res) => {
       .save(outputPath);
 
   } catch (err) {
-    console.error('SERVER ERROR:', err);
+    console.error("SERVER ERROR:", err);
 
     cleanup(inputPath, outputPath);
 
-    if (!res.headersSent) {
-      res.status(500).json({
-        success: false,
-        error: 'Server error',
-        details: err.message
-      });
-    }
+    res.status(500).json({
+      success: false,
+      error: err.message
+    });
   }
 });
 
-// ===================== THUMBNAIL (FIXED + REQUIRED FOR YOUR PIPELINE) =====================
+// ===================== THUMBNAIL (FIXÉ + STABLE RENDER) =====================
 app.post('/thumbnail', async (req, res) => {
   let inputPath, outputPath;
 
@@ -121,68 +130,55 @@ app.post('/thumbnail', async (req, res) => {
     }
 
     const id = Date.now();
-    inputPath = path.join('/tmp', `thumb-input-${id}.mp4`);
+    inputPath = path.join('/tmp', `input-${id}.mp4`);
     outputPath = path.join('/tmp', `thumb-${id}.jpg`);
 
-    // 📥 Download video
+    console.log("Downloading video for thumbnail...");
+
     await downloadFile(videoUrl, inputPath);
-    console.log('Thumbnail input downloaded:', inputPath);
 
-    // 📸 Extract frame (thumbnail)
-    ffmpeg(inputPath)
-      .screenshots({
-        timestamps: ['50%'],
-        filename: path.basename(outputPath),
-        folder: '/tmp',
-        size: '1280x720'
-      })
-      .on('end', () => {
-        console.log('Thumbnail generated');
+    if (!fs.existsSync(inputPath)) {
+      throw new Error("Download failed");
+    }
 
-        res.download(outputPath, () => {
-          cleanup(inputPath, outputPath);
-        });
-      })
-      .on('error', (err) => {
-        console.error('THUMBNAIL ERROR:', err);
+    console.log("Generating thumbnail...");
 
-        cleanup(inputPath, outputPath);
+    // 🔥 VERSION STABLE POUR RENDER
+    await new Promise((resolve, reject) => {
+      ffmpeg(inputPath)
+        .screenshots({
+          timestamps: ['00:00:01'], // stable vs 50%
+          filename: path.basename(outputPath),
+          folder: '/tmp',
+          size: '1280x720'
+        })
+        .on('end', resolve)
+        .on('error', reject);
+    });
 
-        if (!res.headersSent) {
-          res.status(500).json({
-            success: false,
-            error: 'Thumbnail failed',
-            details: err.message
-          });
-        }
-      });
+    if (!fs.existsSync(outputPath)) {
+      throw new Error("Thumbnail not created");
+    }
+
+    console.log("Thumbnail generated successfully");
+
+    res.download(outputPath, () => {
+      cleanup(inputPath, outputPath);
+    });
 
   } catch (err) {
-    console.error('SERVER ERROR:', err);
+    console.error("THUMBNAIL ERROR:", err);
 
     cleanup(inputPath, outputPath);
 
-    if (!res.headersSent) {
-      res.status(500).json({
-        success: false,
-        error: 'Server error',
-        details: err.message
-      });
-    }
+    res.status(500).json({
+      success: false,
+      error: err.message
+    });
   }
 });
 
-// ===================== CLEANUP =====================
-function cleanup(inputPath, outputPath) {
-  try {
-    if (inputPath && fs.existsSync(inputPath)) fs.unlinkSync(inputPath);
-    if (outputPath && fs.existsSync(outputPath)) fs.unlinkSync(outputPath);
-  } catch (e) {
-    console.error('Cleanup error:', e.message);
-  }
-}
-
-// ===================== START =====================
+// ===================== START SERVER =====================
 app.listen(PORT, () => {
   console.log(`Server running on port ${PORT}`);
 });
