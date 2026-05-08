@@ -3,6 +3,7 @@ const cors = require('cors');
 const ffmpeg = require('fluent-ffmpeg');
 const fs = require('fs');
 const axios = require('axios');
+const path = require('path');
 
 const app = express();
 app.use(cors());
@@ -10,13 +11,107 @@ app.use(express.json());
 
 const PORT = process.env.PORT || 3000;
 
+// ===================== HEALTH CHECK =====================
 app.get('/', (req, res) => {
-  res.send('FFmpeg API running');
+  res.json({
+    status: 'ok',
+    service: 'ffmpeg-api',
+    time: new Date().toISOString()
+  });
 });
 
+// ===================== UTIL: DOWNLOAD FILE =====================
+const downloadFile = async (url, outputPath) => {
+  const writer = fs.createWriteStream(outputPath);
+
+  const response = await axios({
+    url,
+    method: 'GET',
+    responseType: 'stream',
+    timeout: 30000
+  });
+
+  response.data.pipe(writer);
+
+  return new Promise((resolve, reject) => {
+    writer.on('finish', resolve);
+    writer.on('error', reject);
+  });
+};
+
+// ===================== COMPRESS VIDEO =====================
 app.post('/compress', async (req, res) => {
-  let inputPath = null;
-  let outputPath = null;
+  let inputPath, outputPath;
+
+  try {
+    const videoUrl = req.body.url;
+    if (!videoUrl) {
+      return res.status(400).json({ error: 'No URL provided' });
+    }
+
+    const id = Date.now();
+    inputPath = path.join('/tmp', `input-${id}.mp4`);
+    outputPath = path.join('/tmp', `output-${id}.mp4`);
+
+    // 📥 Download
+    await downloadFile(videoUrl, inputPath);
+    console.log('Video downloaded:', inputPath);
+
+    // 🎬 FFmpeg process
+    ffmpeg(inputPath)
+      .outputOptions([
+        '-c:v libx264',
+        '-preset ultrafast',
+        '-crf 28',
+        '-vf scale=1280:-2',
+        '-threads 1',
+        '-c:a aac',
+        '-b:a 96k',
+        '-movflags +faststart'
+      ])
+      .on('start', (cmd) => {
+        console.log('FFmpeg command:', cmd);
+      })
+      .on('error', (err) => {
+        console.error('FFmpeg ERROR:', err);
+
+        cleanup(inputPath, outputPath);
+
+        if (!res.headersSent) {
+          res.status(500).json({
+            success: false,
+            error: 'FFmpeg failed',
+            details: err.message
+          });
+        }
+      })
+      .on('end', () => {
+        console.log('Compression finished');
+
+        res.download(outputPath, () => {
+          cleanup(inputPath, outputPath);
+        });
+      })
+      .save(outputPath);
+
+  } catch (err) {
+    console.error('SERVER ERROR:', err);
+
+    cleanup(inputPath, outputPath);
+
+    if (!res.headersSent) {
+      res.status(500).json({
+        success: false,
+        error: 'Server error',
+        details: err.message
+      });
+    }
+  }
+});
+
+// ===================== THUMBNAIL (FIXED + REQUIRED FOR YOUR PIPELINE) =====================
+app.post('/thumbnail', async (req, res) => {
+  let inputPath, outputPath;
 
   try {
     const videoUrl = req.body.url;
@@ -25,79 +120,69 @@ app.post('/compress', async (req, res) => {
       return res.status(400).json({ error: 'No URL provided' });
     }
 
-    inputPath = `input-${Date.now()}.mp4`;
-    outputPath = `output-${Date.now()}.mp4`;
+    const id = Date.now();
+    inputPath = path.join('/tmp', `thumb-input-${id}.mp4`);
+    outputPath = path.join('/tmp', `thumb-${id}.jpg`);
 
-    // 📥 DOWNLOAD VIDEO (avec timeout)
-    const writer = fs.createWriteStream(inputPath);
+    // 📥 Download video
+    await downloadFile(videoUrl, inputPath);
+    console.log('Thumbnail input downloaded:', inputPath);
 
-    const response = await axios({
-      url: videoUrl,
-      method: 'GET',
-      responseType: 'stream',
-      timeout: 20000
-    });
-
-    response.data.pipe(writer);
-
-    await new Promise((resolve, reject) => {
-      writer.on('finish', resolve);
-      writer.on('error', reject);
-    });
-
-    console.log('Video downloaded:', fs.existsSync(inputPath));
-
-    // 🎬 FFMPEG SAFE (ANTI CRASH RAILWAY)
+    // 📸 Extract frame (thumbnail)
     ffmpeg(inputPath)
-      .outputOptions([
-        '-c:v libx264',
-        '-preset ultrafast',
-        '-crf 28',
-        '-vf scale=1280:-2',
-        '-threads 1',
-        '-max_muxing_queue_size 1024',
-        '-c:a aac',
-        '-b:a 96k',
-        '-movflags +faststart'
-      ])
-      .on('start', (cmd) => {
-        console.log('FFmpeg command:', cmd);
-      })
-      .on('stderr', (line) => {
-        console.log('FFmpeg:', line);
+      .screenshots({
+        timestamps: ['50%'],
+        filename: path.basename(outputPath),
+        folder: '/tmp',
+        size: '1280x720'
       })
       .on('end', () => {
-        console.log('Compression finished');
+        console.log('Thumbnail generated');
 
         res.download(outputPath, () => {
-          if (fs.existsSync(inputPath)) fs.unlinkSync(inputPath);
-          if (fs.existsSync(outputPath)) fs.unlinkSync(outputPath);
+          cleanup(inputPath, outputPath);
         });
       })
       .on('error', (err) => {
-        console.error('FFmpeg ERROR:', err);
+        console.error('THUMBNAIL ERROR:', err);
 
-        if (fs.existsSync(inputPath)) fs.unlinkSync(inputPath);
-        if (fs.existsSync(outputPath)) fs.unlinkSync(outputPath);
+        cleanup(inputPath, outputPath);
 
         if (!res.headersSent) {
-          res.status(500).json({ error: 'FFmpeg failed' });
+          res.status(500).json({
+            success: false,
+            error: 'Thumbnail failed',
+            details: err.message
+          });
         }
-      })
-      .save(outputPath);
+      });
 
   } catch (err) {
     console.error('SERVER ERROR:', err);
 
-    if (inputPath && fs.existsSync(inputPath)) fs.unlinkSync(inputPath);
-    if (outputPath && fs.existsSync(outputPath)) fs.unlinkSync(outputPath);
+    cleanup(inputPath, outputPath);
 
     if (!res.headersSent) {
-      res.status(500).json({ error: 'Server error' });
+      res.status(500).json({
+        success: false,
+        error: 'Server error',
+        details: err.message
+      });
     }
   }
 });
 
+// ===================== CLEANUP =====================
+function cleanup(inputPath, outputPath) {
+  try {
+    if (inputPath && fs.existsSync(inputPath)) fs.unlinkSync(inputPath);
+    if (outputPath && fs.existsSync(outputPath)) fs.unlinkSync(outputPath);
+  } catch (e) {
+    console.error('Cleanup error:', e.message);
+  }
+}
+
+// ===================== START =====================
 app.listen(PORT, () => {
   console.log(`Server running on port ${PORT}`);
 });
